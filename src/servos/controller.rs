@@ -267,7 +267,7 @@ impl ControlUnit {
                     self.state = ControlUnitState::Moving { pending_mask: new_pending };
                 }
             }
-            ControlUnitState::Paused { pending_mask } => {
+            ControlUnitState::Paused { .. } => {
                 // 暂停状态不处理完成事件
             }
             ControlUnitState::Idle => {}
@@ -346,20 +346,44 @@ impl ControlUnit {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use super::profile::{PhysicalParams, DEFAULT_MID_PWM_US, CorrectionParams};
-    use super::config::{ConfigManager, Storage, StorageError};
+    use crate::servos::config::{ConfigManager, Storage, StorageError};
+    use crate::servos::profile::SERVO_COUNT;
 
     // 模拟存储
-    struct MockStorage;
+    struct MockStorage {
+        data: [u8; SERVO_COUNT * 8],
+    }
+
+    impl MockStorage {
+        fn new() -> Self {
+            Self {
+                data: [0; SERVO_COUNT * 8],
+            }
+        }
+    }
+
     impl Storage for MockStorage {
-        fn read(&mut self, _offset: usize, _buf: &mut [u8]) -> Result<usize, StorageError> { unimplemented!() }
-        fn write(&mut self, _offset: usize, _buf: &[u8]) -> Result<usize, StorageError> { unimplemented!() }
+        fn read(&mut self, offset: usize, buf: &mut [u8]) -> Result<usize, StorageError> {
+            if offset + buf.len() > self.data.len() {
+                return Err(StorageError::InvalidLength);
+            }
+            buf.copy_from_slice(&self.data[offset..offset + buf.len()]);
+            Ok(buf.len())
+        }
+
+        fn write(&mut self, offset: usize, buf: &[u8]) -> Result<usize, StorageError> {
+            if offset + buf.len() > self.data.len() {
+                return Err(StorageError::InvalidLength);
+            }
+            self.data[offset..offset + buf.len()].copy_from_slice(buf);
+            Ok(buf.len())
+        }
     }
 
     // 辅助函数：创建测试用的引擎和配置
     fn setup() -> (MotionEngine, ConfigManager<MockStorage>) {
         let engine = MotionEngine::new();
-        let storage = MockStorage;
+        let storage = MockStorage::new();
         let config = ConfigManager::new(storage).unwrap();
         (engine, config)
     }
