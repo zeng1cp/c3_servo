@@ -357,31 +357,14 @@ impl ServoProfile {
 
     /// 将角度转换为脉冲宽度（线性插值），并应用校正。
     pub fn angle_to_pwm(&self, angle: AngleDeg) -> PulseWidthUs {
-        let angle = angle.0.clamp(self.physical.min_angle_deg, self.physical.max_angle_deg);
-        let range_angle = self.physical.max_angle_deg - self.physical.min_angle_deg;
-        if range_angle <= f32::EPSILON {
-            return PulseWidthUs(self.physical.mid_pwm_us);
-        }
-        let ratio = (angle - self.physical.min_angle_deg) / range_angle;
-        let pwm = self.physical.min_pwm_us as f32
-            + (self.physical.max_pwm_us - self.physical.min_pwm_us) as f32 * ratio;
-        // 手动四舍五入（适用于正数），避免依赖 round 方法
-        let pwm_us = (pwm + 0.5) as u16;
-        self.clamp_and_correct_pwm(PulseWidthUs(pwm_us))
+        let pwm = self.physical.angle_to_pwm(angle);
+        self.clamp_and_correct_pwm(pwm)
     }
 
     /// 将脉冲宽度转换为角度（线性插值），不考虑校正（校正只影响输出，不影响角度反馈）。
     pub fn pwm_to_angle(&self, pwm: PulseWidthUs) -> AngleDeg {
         // 注意：这里使用物理参数直接转换，不考虑校正，因为校正仅用于输出到舵机。
-        let pwm = pwm.0.clamp(self.physical.min_pwm_us, self.physical.max_pwm_us) as f32;
-        let range_pwm = (self.physical.max_pwm_us - self.physical.min_pwm_us) as f32;
-        if range_pwm <= f32::EPSILON {
-            return AngleDeg(self.physical.mid_angle_deg);
-        }
-        let ratio = (pwm - self.physical.min_pwm_us as f32) / range_pwm;
-        let angle = self.physical.min_angle_deg
-            + (self.physical.max_angle_deg - self.physical.min_angle_deg) * ratio;
-        AngleDeg(angle)
+        self.physical.pwm_to_angle(pwm)
     }
 
     /// 获取当前校正后的目标脉冲宽度（用于运动引擎），
