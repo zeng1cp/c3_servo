@@ -404,7 +404,7 @@ pub fn quadratic_out_easing(t: f32) -> f32 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::profile::{DEFAULT_MID_PWM_US, PhysicalParams};
+    use crate::servos::profile::{DEFAULT_MID_PWM_US, PhysicalParams};
 
     #[test]
     fn test_move_pwm_immediate() {

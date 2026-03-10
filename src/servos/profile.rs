@@ -181,6 +181,34 @@ impl PhysicalParams {
         }
         Ok(())
     }
+
+    /// 将角度转换为脉冲宽度（线性插值）。
+    ///
+    /// 输入角度会被限制到 `[min_angle_deg, max_angle_deg]`。
+    pub fn angle_to_pwm(&self, angle: AngleDeg) -> PulseWidthUs {
+        let angle = angle.0.clamp(self.min_angle_deg, self.max_angle_deg);
+        let range_angle = self.max_angle_deg - self.min_angle_deg;
+        if range_angle <= f32::EPSILON {
+            return PulseWidthUs(self.mid_pwm_us);
+        }
+        let ratio = (angle - self.min_angle_deg) / range_angle;
+        let pwm = self.min_pwm_us as f32 + (self.max_pwm_us - self.min_pwm_us) as f32 * ratio;
+        PulseWidthUs((pwm + 0.5) as u16)
+    }
+
+    /// 将脉冲宽度转换为角度（线性插值）。
+    ///
+    /// 输入脉冲会被限制到 `[min_pwm_us, max_pwm_us]`。
+    pub fn pwm_to_angle(&self, pwm: PulseWidthUs) -> AngleDeg {
+        let pwm = pwm.0.clamp(self.min_pwm_us, self.max_pwm_us) as f32;
+        let range_pwm = (self.max_pwm_us - self.min_pwm_us) as f32;
+        if range_pwm <= f32::EPSILON {
+            return AngleDeg(self.mid_angle_deg);
+        }
+        let ratio = (pwm - self.min_pwm_us as f32) / range_pwm;
+        let angle = self.min_angle_deg + (self.max_angle_deg - self.min_angle_deg) * ratio;
+        AngleDeg(angle)
+    }
 }
 
 impl Default for PhysicalParams {
@@ -390,6 +418,3 @@ impl fmt::Display for ConfigError {
         }
     }
 }
-
-#[cfg(feature = "std")]
-impl std::error::Error for ConfigError {}

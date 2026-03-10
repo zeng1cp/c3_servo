@@ -132,7 +132,7 @@ impl<'a, const N: usize> ServoDrivers<'a, N> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::profile::DEFAULT_MID_PWM_US;
+    use crate::servos::profile::DEFAULT_MID_PWM_US;
 
     struct MockPwm {
         last_pulse: u16,

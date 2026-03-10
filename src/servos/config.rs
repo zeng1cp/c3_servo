@@ -49,7 +49,7 @@ pub trait Storage {
 // ----------------------------------------------------------------------------
 
 /// 配置管理器错误类型
-#[derive(Debug)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ConfigError {
     /// 校正参数解析错误（来自 profile 模块）
     Profile(profile::ConfigError),
@@ -186,7 +186,7 @@ impl<S: Storage> ConfigManager<S> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::profile::CorrectionParams;
+    use crate::servos::profile::CorrectionParams;
 
     // 一个简单的内存存储模拟器，用于测试
     struct MemStorage {
