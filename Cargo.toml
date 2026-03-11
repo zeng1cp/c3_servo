@@ -9,15 +9,14 @@ name = "c3_servo"
 path = "./src/bin/main.rs"
 
 [dependencies]
+critical-section = "1.2.0"
+embedded-hal = "1.0.0"
+
+[target.'cfg(target_arch = "riscv32")'.dependencies]
 esp-hal = { version = "~1.0", features = ["defmt", "esp32c3", "unstable"] }
-
-
 defmt                  = "1.0.1"
 esp-bootloader-esp-idf = { version = "0.4.0", features = ["defmt", "esp32c3"] }
-
-critical-section = "1.2.0"
 esp-println      = { version = "0.16.1", features = ["defmt-espflash", "esp32c3"] }
-embedded-hal = "1.0.0"
 
 
 [profile.dev]

@@ -11,7 +11,5 @@ rustflags = [
   "-C", "force-frame-pointers",
 ]
 
-target = "riscv32imc-unknown-none-elf"
-
 [unstable]
 build-std = ["core"]

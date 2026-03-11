@@ -1,4 +1,11 @@
 fn main() {
+    let target = std::env::var("TARGET").unwrap_or_default();
+    let is_embedded = target == "riscv32imc-unknown-none-elf";
+
+    if !is_embedded {
+        return;
+    }
+
     linker_be_nice();
     println!("cargo:rustc-link-arg=-Tdefmt.x");
     // make sure linkall.x is the last linker script (otherwise might cause problems with flip-link)
