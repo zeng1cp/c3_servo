@@ -1,35 +1,32 @@
-//! 硬件抽象层（HAL）
+//! 舵机 PWM 输出的硬件抽象层。
 //!
-//! 本模块定义了 PWM 输出 trait 以及基于 ESP32-C3 LEDC 的具体实现。
-//! 提供 `ServoDrivers` 结构，使用 const 泛型支持任意数量舵机，通过动态分发数组管理硬件通道。
+//! 该模块把具体 LEDC 通道与上层运动控制逻辑隔离开：
+//! 上层只关心脉宽，硬件层负责把微秒脉宽换算成底层 PWM 占空比。
 
 use core::marker::PhantomData;
 use embedded_hal::pwm::SetDutyCycle;
-use esp_hal::ledc::channel::ChannelIFace;
 use esp_hal::ledc::LowSpeed;
+use esp_hal::ledc::channel::ChannelIFace;
 
-use super::profile::{DEFAULT_MID_PWM_US, PulseWidthUs, ServoId, SERVO_PERIOD_US};
+use super::profile::{DEFAULT_MID_PWM_US, PulseWidthUs, SERVO_PERIOD_US, ServoId};
 
-/// 硬件抽象层错误类型
+/// 硬件抽象层可能返回的错误。
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum HalError {
-    /// 驱动错误（例如 PWM 设置失败）
+    /// 底层 PWM 驱动调用失败。
     Driver,
-    /// 无效的通道或舵机 ID
+    /// `ServoId` 对应的驱动槽位不存在。
     InvalidChannel,
 }
 
-/// PWM 输出抽象 trait
+/// 以脉宽为中心的 PWM 输出抽象。
 ///
-/// 任何实现了此 trait 的类型都可以作为舵机的硬件输出通道。
+/// 该 trait 将具体定时器/通道实现隐藏在后面，使运动层不依赖特定 HAL。
 pub trait PwmOutput {
-    /// 设置脉冲宽度（微秒）
     fn set_pulse_width_us(&mut self, us: u16) -> Result<(), HalError>;
 }
 
-/// ESP32-C3 LEDC PWM 通道适配器
-///
-/// 包装 esp-hal 的 LEDC 通道，实现 `PwmOutput` trait。
+/// 基于 `esp-hal` LEDC 通道的 `PwmOutput` 适配器。
 pub struct LedcPwmChannel<'a, C>
 where
     C: ChannelIFace<'a, LowSpeed> + SetDutyCycle,
@@ -42,7 +39,7 @@ impl<'a, C> LedcPwmChannel<'a, C>
 where
     C: ChannelIFace<'a, LowSpeed> + SetDutyCycle,
 {
-    /// 创建新的 LEDC 通道适配器
+    /// 包装一个已初始化的 LEDC 通道。
     pub fn new(ch: C) -> Self {
         Self {
             ch,
@@ -50,9 +47,9 @@ where
         }
     }
 
-    /// 将脉冲宽度（微秒）转换为占空比计数值
     #[inline]
     fn pulse_to_duty(max_duty: u16, pulse_us: u16) -> u16 {
+        // 舵机以固定周期工作，因此这里只需在线性区间内换算高电平脉宽。
         let duty = (u32::from(pulse_us) * u32::from(max_duty)) / SERVO_PERIOD_US;
         duty.min(u32::from(max_duty)) as u16
     }
@@ -70,58 +67,57 @@ where
     }
 }
 
-/// 舵机驱动器聚合体（支持任意数量舵机）
+/// 一组按 `ServoId::index()` 映射的舵机驱动。
 ///
-/// 通过 const 泛型 `N` 指定舵机数量，内部存储一个动态分发数组 `[&mut dyn PwmOutput; N]`。
-/// 这种设计允许轻松修改舵机数量，只需调整 `SERVO_COUNT` 和 `ServoId` 枚举即可。
+/// `cache` 记录最近一次成功下发到硬件的脉宽，便于上层在不访问硬件寄存器的情况下读取状态。
 pub struct ServoDrivers<'a, const N: usize> {
     drivers: [&'a mut dyn PwmOutput; N],
     cache: [PulseWidthUs; N],
 }
 
 impl<'a, const N: usize> ServoDrivers<'a, N> {
-    /// 创建新的舵机驱动器实例
-    ///
-    /// # 参数
-    /// * `drivers` - 一个长度等于舵机数量的数组，每个元素是对应 PWM 通道的可变引用。
+    /// 创建一组按 `ServoId::index()` 对齐的舵机驱动。
     pub fn new(drivers: [&'a mut dyn PwmOutput; N]) -> Self {
-        // 缓存默认初始化为默认中点脉冲值，但此时不会写入硬件
-        let cache = [PulseWidthUs(DEFAULT_MID_PWM_US); N];
-        Self { drivers, cache }
+        Self {
+            drivers,
+            cache: [PulseWidthUs(DEFAULT_MID_PWM_US); N],
+        }
     }
 
-    /// 初始化所有舵机：将缓存中的脉冲值写入硬件
+    /// 以缓存中的初始脉宽同步所有输出通道。
     pub fn init_all(&mut self) -> Result<(), HalError> {
-        for i in 0..N {
-            self.drivers[i].set_pulse_width_us(self.cache[i].0)?;
+        for index in 0..N {
+            self.drivers[index].set_pulse_width_us(self.cache[index].0)?;
         }
         Ok(())
     }
 
-    /// 设置指定舵机的脉冲宽度（微秒），并更新缓存
-    ///
-    /// # 注意
-    /// 调用者需确保 `id.index()` 在 `0..N` 范围内，通常由 `ServoId` 的定义保证。
+    /// 按微秒单位更新指定舵机的目标脉宽。
     pub fn set_pulse_us(&mut self, id: ServoId, us: u16) -> Result<(), HalError> {
-        let pulse = PulseWidthUs(us);
-        self.set_pulse(id, pulse)
+        self.set_pulse(id, PulseWidthUs(us))
     }
 
-    /// 设置指定舵机的脉冲宽度（`PulseWidthUs`），并更新缓存
+    /// 使用 `PulseWidthUs` 更新指定舵机的目标脉宽。
     pub fn set_pulse_width(&mut self, id: ServoId, pulse: PulseWidthUs) -> Result<(), HalError> {
         self.set_pulse(id, pulse)
     }
 
-    /// 获取指定舵机上次设置的脉冲宽度（缓存值）
-    pub fn cached_pulse(&self, id: ServoId) -> PulseWidthUs {
-        self.cache[id.index()]
+    /// 读取最近一次成功写入硬件的缓存值。
+    pub fn cached_pulse(&self, id: ServoId) -> Result<PulseWidthUs, HalError> {
+        self.cache
+            .get(id.index())
+            .copied()
+            .ok_or(HalError::InvalidChannel)
     }
 
-    /// 内部方法：实际写入硬件并更新缓存
     fn set_pulse(&mut self, id: ServoId, pulse: PulseWidthUs) -> Result<(), HalError> {
-        let idx = id.index();
-        self.drivers[idx].set_pulse_width_us(pulse.0)?;
-        self.cache[idx] = pulse;
+        let index = id.index();
+        self.drivers
+            .get_mut(index)
+            .ok_or(HalError::InvalidChannel)?
+            .set_pulse_width_us(pulse.0)?;
+        // 只有在底层驱动成功接受更新后才刷新缓存，避免缓存与硬件状态失配。
+        *self.cache.get_mut(index).ok_or(HalError::InvalidChannel)? = pulse;
         Ok(())
     }
 }

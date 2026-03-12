@@ -1,141 +1,151 @@
-//! 配置管理器与持久化存储
+//! 舵机校正参数的持久化管理。
 //!
-//! 本模块提供舵机校正参数的统一管理，并支持通过抽象的 `Storage` trait 进行非易失存储。
-//! 上层可通过 `ConfigManager` 读取/修改单个舵机的校正参数，并调用 `save()` 持久化。
+//! 该模块只持久化 `CorrectionParams`，不持久化物理参数：
+//! 物理参数通常随固件编译产物提供，而校正参数需要在设备运行后调试并保存。
 
-use super::profile::{self, CorrectionParams, ServoId, SERVO_COUNT};
+use super::profile::{self, CorrectionParams, SERVO_COUNT, ServoId};
 
-// ----------------------------------------------------------------------------
-// 存储抽象
-// ----------------------------------------------------------------------------
+/// 单个 `CorrectionParams` 的固定序列化长度。
+const PARAM_SIZE: usize = 8;
+const PAYLOAD_SIZE: usize = SERVO_COUNT * PARAM_SIZE;
+const HEADER_SIZE: usize = 16;
+const STORED_SIZE: usize = HEADER_SIZE + PAYLOAD_SIZE;
+const FORMAT_MAGIC: [u8; 4] = *b"SCFG";
+const FORMAT_VERSION: u8 = 1;
 
-/// 存储操作错误类型
+/// 存储层访问失败时返回的错误。
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum StorageError {
-    /// 读取失败（例如地址无效、硬件错误）
+    /// 读取底层存储介质失败。
     ReadFailed,
-    /// 写入失败
+    /// 写入底层存储介质失败。
     WriteFailed,
-    /// 擦除失败（对于 Flash 等介质）
+    /// 擦除底层存储介质失败。
     EraseFailed,
-    /// 数据长度不匹配
+    /// 底层返回的读写长度与请求不符。
     InvalidLength,
 }
 
-/// 存储介质抽象 trait
+/// 面向字节数组的最小存储抽象。
 ///
-/// 实现此 trait 即可将配置管理器适配到不同的非易失存储（EEPROM、Flash、文件等）。
+/// 偏移量和长度均由 `ConfigManager` 控制，具体介质可以是 EEPROM、Flash 或测试桩。
 pub trait Storage {
-    /// 从指定偏移读取数据到缓冲区，返回实际读取的字节数。
-    ///
-    /// 如果偏移或长度超出介质范围，应返回错误。
     fn read(&mut self, offset: usize, buf: &mut [u8]) -> Result<usize, StorageError>;
 
-    /// 将缓冲区数据写入指定偏移，返回实际写入的字节数。
-    ///
-    /// 对于某些介质（如 Flash），可能需要在写入前确保相应区域已擦除。
     fn write(&mut self, offset: usize, buf: &[u8]) -> Result<usize, StorageError>;
 
-    /// 擦除指定区域（如果需要）。对于不需要擦除的介质（如 EEPROM），可直接返回成功。
     fn erase(&mut self, offset: usize, len: usize) -> Result<(), StorageError> {
-        // 默认实现：无操作，返回成功
         let _ = (offset, len);
         Ok(())
     }
 }
 
-// ----------------------------------------------------------------------------
-// 配置管理器错误
-// ----------------------------------------------------------------------------
-
-/// 配置管理器错误类型
+/// 配置管理器在解析或保存配置时返回的错误。
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ConfigError {
-    /// 校正参数解析错误（来自 profile 模块）
+    /// 单个校正项的字节内容非法。
     Profile(profile::ConfigError),
-    /// 存储操作错误
+    /// 底层存储介质访问失败。
     Storage(StorageError),
-    /// 存储数据长度不匹配（读取的数据长度不等于期望值）
+    /// 存储中的总长度与当前格式定义不一致。
     InvalidDataLength,
+    /// 头部魔数不匹配，通常表示该区域未写入本模块格式的数据。
+    InvalidMagic,
+    /// 读取到受支持范围之外的配置版本。
+    UnsupportedVersion(u8),
+    /// CRC 校验失败，说明存储内容已损坏或未写完整。
+    ChecksumMismatch,
 }
 
-// 允许从 profile::ConfigError 和 StorageError 自动转换
+/// `load()` 的结果状态。
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum LoadStatus {
+    /// 成功读取并解析已有配置。
+    Loaded,
+    /// 存储区域为空或处于擦除态。
+    Empty,
+    /// 读取失败后回退到默认值，并携带触发回退的错误。
+    Defaulted(ConfigError),
+}
+
 impl From<profile::ConfigError> for ConfigError {
-    fn from(e: profile::ConfigError) -> Self {
-        Self::Profile(e)
+    fn from(value: profile::ConfigError) -> Self {
+        Self::Profile(value)
     }
 }
 
 impl From<StorageError> for ConfigError {
-    fn from(e: StorageError) -> Self {
-        Self::Storage(e)
+    fn from(value: StorageError) -> Self {
+        Self::Storage(value)
     }
 }
 
-// ----------------------------------------------------------------------------
-// 配置管理器
-// ----------------------------------------------------------------------------
-
-/// 舵机校正参数管理器
-///
-/// 内部维护所有舵机的 `CorrectionParams`，并提供读取、修改、保存、加载功能。
-/// 保存和加载通过传入的 `Storage` 实现完成。
+/// 管理校正参数在内存与存储层之间同步的组件。
 pub struct ConfigManager<S: Storage> {
     storage: S,
     corrections: [CorrectionParams; SERVO_COUNT],
-    dirty: bool, // 标记是否有未保存的修改
+    dirty: bool,
 }
 
 impl<S: Storage> ConfigManager<S> {
-    /// 创建新的配置管理器，并从存储中加载已有数据。
-    ///
-    /// 如果存储中无有效数据或读取失败，则使用默认参数（`CorrectionParams::default()`）。
+    /// 创建配置管理器，并要求存储中的数据必须可成功加载。
     pub fn new(storage: S) -> Result<Self, ConfigError> {
-        let mut mgr = Self {
-            storage,
-            corrections: [CorrectionParams::default(); SERVO_COUNT],
-            dirty: false,
-        };
-        // 尝试加载，忽略错误（使用默认值）
-        let _ = mgr.load();
-        Ok(mgr)
+        let mut mgr = Self::default_with_storage(storage);
+        match mgr.load()? {
+            LoadStatus::Loaded | LoadStatus::Empty => Ok(mgr),
+            LoadStatus::Defaulted(_) => unreachable!("load() never returns Defaulted"),
+        }
     }
 
-    /// 获取指定舵机的校正参数副本。
+    /// 创建配置管理器，并在加载失败时回退到默认校正参数。
+    ///
+    /// 返回的 `LoadStatus` 可让上层区分是正常加载、空存储还是错误后回退。
+    pub fn new_with_default_fallback(storage: S) -> Result<(Self, LoadStatus), ConfigError> {
+        let mut mgr = Self::default_with_storage(storage);
+        let status = match mgr.load() {
+            Ok(status) => status,
+            Err(err) => {
+                mgr.dirty = true;
+                LoadStatus::Defaulted(err)
+            }
+        };
+        Ok((mgr, status))
+    }
+
+    /// 读取指定舵机的校正参数副本。
     pub fn get_correction(&self, id: ServoId) -> CorrectionParams {
         self.corrections[id.index()]
     }
 
-    /// 设置指定舵机的校正参数，并标记脏数据。
+    /// 更新指定舵机的校正参数，并标记配置为 dirty。
     pub fn set_correction(&mut self, id: ServoId, params: CorrectionParams) {
         self.corrections[id.index()] = params;
         self.dirty = true;
     }
 
-    /// 将当前所有校正参数保存到存储介质。
+    /// 将当前校正参数写回存储层。
     ///
-    /// 如果 `dirty` 为 `false`，则直接返回成功，不执行实际写入。
+    /// 只有 `dirty == true` 时才会真正触发擦除与写入。
     pub fn save(&mut self) -> Result<(), ConfigError> {
         if !self.dirty {
             return Ok(());
         }
 
-        // 计算总数据大小
-        const PARAM_SIZE: usize = 8; // CorrectionParams::to_bytes() 返回 [u8;8]
-        const TOTAL_SIZE: usize = SERVO_COUNT * PARAM_SIZE;
+        let payload = self.serialize_payload();
+        let checksum = crc32(&payload);
 
-        // 在栈上分配缓冲区（SERVO_COUNT 较小，如6时仅48字节）
-        let mut buf = [0u8; TOTAL_SIZE];
+        let mut buf = [0u8; STORED_SIZE];
+        buf[..4].copy_from_slice(&FORMAT_MAGIC);
+        buf[4] = FORMAT_VERSION;
+        buf[8..12].copy_from_slice(&(PAYLOAD_SIZE as u32).to_le_bytes());
+        buf[12..16].copy_from_slice(&checksum.to_le_bytes());
+        buf[HEADER_SIZE..].copy_from_slice(&payload);
 
-        // 将所有校正参数序列化到缓冲区
-        for (i, params) in self.corrections.iter().enumerate() {
-            let offset = i * PARAM_SIZE;
-            buf[offset..offset + PARAM_SIZE].copy_from_slice(&params.to_bytes());
-        }
+        // 先擦后写，避免旧内容残留导致 CRC 与长度字段不一致。
+        self.storage.erase(0, STORED_SIZE)?;
 
-        // 写入存储（假设从偏移0开始）
         let written = self.storage.write(0, &buf)?;
-        if written != TOTAL_SIZE {
+        if written != STORED_SIZE {
             return Err(StorageError::InvalidLength.into());
         }
 
@@ -143,40 +153,100 @@ impl<S: Storage> ConfigManager<S> {
         Ok(())
     }
 
-    /// 从存储介质加载校正参数，覆盖当前内存中的值。
+    /// 从存储层加载校正参数。
     ///
-    /// 如果存储数据长度不足或解析失败，将保留原有值（不修改），并返回错误。
-    pub fn load(&mut self) -> Result<(), ConfigError> {
-        const PARAM_SIZE: usize = 8;
-        const TOTAL_SIZE: usize = SERVO_COUNT * PARAM_SIZE;
-
-        let mut buf = [0u8; TOTAL_SIZE];
+    /// 该方法会校验魔数、版本、长度与 CRC；任一校验失败都会拒绝接纳该数据。
+    pub fn load(&mut self) -> Result<LoadStatus, ConfigError> {
+        let mut buf = [0u8; STORED_SIZE];
         let read = self.storage.read(0, &mut buf)?;
-        if read != TOTAL_SIZE {
+
+        if read == 0 {
+            return Ok(LoadStatus::Empty);
+        }
+
+        if read != STORED_SIZE {
+            if is_erased(&buf[..read]) {
+                return Ok(LoadStatus::Empty);
+            }
             return Err(ConfigError::InvalidDataLength);
         }
 
-        // 解析每个校正参数
-        let mut new_corrections = [CorrectionParams::default(); SERVO_COUNT];
-        for i in 0..SERVO_COUNT {
-            let offset = i * PARAM_SIZE;
-            let slice = &buf[offset..offset + PARAM_SIZE];
-            new_corrections[i] = CorrectionParams::from_bytes(slice)?;
+        if is_erased(&buf) {
+            return Ok(LoadStatus::Empty);
         }
 
-        self.corrections = new_corrections;
+        if buf[..4] != FORMAT_MAGIC {
+            return Err(ConfigError::InvalidMagic);
+        }
+
+        let version = buf[4];
+        if version != FORMAT_VERSION {
+            return Err(ConfigError::UnsupportedVersion(version));
+        }
+
+        let payload_len = u32::from_le_bytes([buf[8], buf[9], buf[10], buf[11]]) as usize;
+        if payload_len != PAYLOAD_SIZE {
+            return Err(ConfigError::InvalidDataLength);
+        }
+
+        let expected_crc = u32::from_le_bytes([buf[12], buf[13], buf[14], buf[15]]);
+        let payload = &buf[HEADER_SIZE..];
+        if crc32(payload) != expected_crc {
+            return Err(ConfigError::ChecksumMismatch);
+        }
+
+        let mut corrections = [CorrectionParams::default(); SERVO_COUNT];
+        for (index, chunk) in payload.chunks_exact(PARAM_SIZE).enumerate() {
+            corrections[index] = CorrectionParams::from_bytes(chunk)?;
+        }
+
+        self.corrections = corrections;
         self.dirty = false;
-        Ok(())
+        Ok(LoadStatus::Loaded)
     }
 
-    /// 检查是否有未保存的修改。
+    /// 当前内存中的校正参数是否尚未持久化。
     pub fn is_dirty(&self) -> bool {
         self.dirty
     }
 
-    /// 获取内部存储的可变引用（如需直接操作存储介质）。
+    /// 暴露底层存储对象的可变引用，便于上层做介质级操作或测试注入。
     pub fn storage_mut(&mut self) -> &mut S {
         &mut self.storage
     }
+
+    fn default_with_storage(storage: S) -> Self {
+        Self {
+            storage,
+            corrections: [CorrectionParams::default(); SERVO_COUNT],
+            dirty: false,
+        }
+    }
+
+    fn serialize_payload(&self) -> [u8; PAYLOAD_SIZE] {
+        let mut payload = [0u8; PAYLOAD_SIZE];
+        for (index, params) in self.corrections.iter().enumerate() {
+            let offset = index * PARAM_SIZE;
+            payload[offset..offset + PARAM_SIZE].copy_from_slice(&params.to_bytes());
+        }
+        payload
+    }
 }
 
+fn is_erased(buf: &[u8]) -> bool {
+    !buf.is_empty()
+        && (buf.iter().all(|&byte| byte == 0x00) || buf.iter().all(|&byte| byte == 0xFF))
+}
+
+/// 计算 payload 的 CRC32，用于检测部分写入或位翻转。
+fn crc32(bytes: &[u8]) -> u32 {
+    let mut crc = 0xFFFF_FFFFu32;
+    for &byte in bytes {
+        crc ^= u32::from(byte);
+        for _ in 0..8 {
+            let mask = (crc & 1).wrapping_neg() & 0xEDB8_8320;
+            crc = (crc >> 1) ^ mask;
+        }
+    }
+    !crc
+}
